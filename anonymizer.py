@@ -1,15 +1,17 @@
+import hashlib
 import os
 import argparse
 import tempfile
 import shutil
-from scapy.all import *
-from scapy.utils import PcapReader
+from scapy.all import * # type: ignore
+from scapy.utils import PcapReader # type: ignore
 import threading
+from threading import RLock  
 from queue import Queue, Empty
 import time
-from typing import Dict, Optional, List, Tuple, DefaultDict
+from typing import Dict, Optional, List, Tuple, DefaultDict,OrderedDict as OrderedDictType
+from collections import OrderedDict
 import logging
-from cryptography.fernet import Fernet
 import ipaddress
 import re
 from contextlib import contextmanager
@@ -17,8 +19,10 @@ from concurrent.futures import ThreadPoolExecutor, Future
 from collections import defaultdict
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
+from Crypto.Cipher import AES # type: ignore
+from Crypto.Random import get_random_bytes # type: ignore
+from Crypto.Util.Padding import pad, unpad # type: ignore
 import base64
-
 # Custom exceptions
 class ProcessingError(Exception):
     """Eccezione sollevata per errori di processing critici."""
@@ -69,16 +73,20 @@ class ProjectDirectories:
                 logging.info(f"Project directory exists: {dir_path}")
 
     @classmethod
-    def get_input_path(cls, filename: str) -> str:
+    def get_input_path(cls, filename: str,is_decrypting: bool) -> str:
         """
         Costruisce il percorso completo per un file di input.
+        In modalità decrypt, cerca il file nella cartella FileCriptati.
         
         Args:
             filename: Nome del file
+            is_decrypting: True se in modalità decrypt
             
         Returns:
-            str: Percorso completo nel formato BASE_DIR/FileDaCrittografare/filename
+            str: Percorso completo nel formato appropriato in base alla modalità
         """
+        if is_decrypting:
+            return os.path.join(cls.ENCRYPTED_DIR, filename)
         return os.path.join(cls.INPUT_DIR, filename)
 
     @classmethod
@@ -112,6 +120,7 @@ class ProjectDirectories:
         return os.path.join(cls.KEYS_DIR, f"encryption_key_{input_filename}.txt")
 
     @classmethod
+
     def verify_directory_structure(cls) -> bool:
         """
         Verifica che la struttura delle directory sia corretta.
@@ -134,6 +143,173 @@ class ProjectDirectories:
                 raise RuntimeError(f"Invalid directory structure. Missing or invalid directory: {dir_path}")
         
         return True
+
+class AESAddressCrypto:
+    """
+    Gestisce la crittografia/decrittografia AES degli indirizzi.
+    Cripta solo i bytes necessari per identificare univocamente un indirizzo.
+    """
+    def __init__(self, key: bytes):
+        """
+        Inizializza il cryptographer AES.
+        
+        Args:
+            key: Chiave AES a 16 byte (128 bit)
+        """
+        if len(key) != 16:  # AES-128
+            raise ValueError("Key must be exactly 16 bytes for AES-128")
+        
+        hash_obj = hashlib.sha256(key)
+        self.ip_key = hash_obj.digest()[:16]
+        self.mac_key = hash_obj.digest()[16:32]
+        self.block_size = AES.block_size
+
+    
+    def encrypt_ip(self, ip: str) -> str:
+        """
+        Critta l'intero indirizzo IP in modo reversibile.
+        """
+        if not ip:
+            return ip
+            
+        try:
+            parts = ip.split('.')
+            if len(parts) != 4:
+                return ip
+            
+            # Usa la chiave specifica per IP
+            cipher = AES.new(self.ip_key, AES.MODE_ECB)  # Usa self.ip_key invece di self.key
+
+            # Converti l'IP in un numero a 32 bit
+            ip_num = sum(int(parts[i]) << (24 - 8 * i) for i in range(4))
+            
+            # Convertiamo il numero in 4 bytes
+            data = ip_num.to_bytes(4, byteorder='big')
+            # Padding per arrivare a 16 bytes (blocco AES)
+            padded = pad(data, 16)
+            encrypted = cipher.encrypt(padded)
+            
+            # Prendi i primi 4 bytes e convertili in nuovo IP
+            enc_num = int.from_bytes(encrypted[:4], byteorder='big')
+            
+            # Costruisci il nuovo IP
+            new_ip = []
+            for i in range(4):
+                new_ip.insert(0, str(enc_num & 255))
+                enc_num >>= 8
+                
+            return '.'.join(new_ip)
+            
+        except Exception as e:
+            logging.error(f"Error encrypting IP {ip}: {e}")
+            return ip
+
+    def decrypt_ip(self, encrypted_ip: str) -> str:
+        """
+        Decripta l'indirizzo IP tornando all'originale.
+        """
+        try:
+            parts = encrypted_ip.split('.')
+            if len(parts) != 4:
+                return encrypted_ip
+                
+            # Decritta usando la stessa modalità
+            cipher = AES.new(self.ip_key, AES.MODE_ECB)
+            # Converti l'IP crittato in numero
+            ip_num = sum(int(parts[i]) << (24 - 8 * i) for i in range(4))
+            # Convertiamo il numero in 4 bytes
+            data = ip_num.to_bytes(4, byteorder='big')
+            # Padding per arrivare a 16 bytes
+            padded = pad(data, 16)
+            decrypted = cipher.decrypt(padded)
+            
+            # Prendi i primi 4 bytes e convertili in IP originale
+            dec_num = int.from_bytes(decrypted[:4], byteorder='big')
+            
+            # Ricostruisci l'IP originale
+            original_ip = []
+            for i in range(4):
+                original_ip.insert(0, str(dec_num & 255))
+                dec_num >>= 8
+                
+            return '.'.join(original_ip)
+            
+        except Exception as e:
+            logging.error(f"Error decrypting IP {encrypted_ip}: {e}")
+            return encrypted_ip
+
+    def encrypt_mac(self, mac: str) -> str:
+        """
+        Critta l'indirizzo MAC in modo reversibile usando AES in modalità ECB.
+        La modalità ECB garantisce che lo stesso MAC produrrà sempre lo stesso output
+        con la stessa chiave, permettendo una corretta decrittazione.
+        """
+        if not mac:
+            return mac
+            
+        try:
+            parts = mac.split(':')
+            if len(parts) != 6:
+                return mac
+                
+            # Converti il MAC in numero a 48 bit
+            mac_num = int(''.join(parts), 16)
+            
+            # Critta il numero
+            cipher = AES.new(self.mac_key, AES.MODE_ECB)
+            data = mac_num.to_bytes(6, byteorder='big')
+            padded = pad(data, 16)
+            encrypted = cipher.encrypt(padded)
+            
+            # Prendi i primi 6 bytes e convertili in nuovo MAC
+            enc_num = int.from_bytes(encrypted[:6], byteorder='big')
+            
+            # Costruisci il nuovo MAC
+            new_mac = []
+            for i in range(6):
+                new_mac.insert(0, f"{enc_num & 255:02x}")
+                enc_num >>= 8
+                
+            return ':'.join(new_mac)
+            
+        except Exception as e:
+            logging.error(f"Error encrypting MAC {mac}: {e}")
+            return mac
+
+    def decrypt_mac(self, encrypted_mac: str) -> str:
+        """
+        Decritta il MAC tornando all'originale.
+        La modalità ECB garantisce che lo stesso input crittato 
+        produrrà sempre lo stesso output con la stessa chiave.
+        """
+        try:
+            parts = encrypted_mac.split(':')
+            if len(parts) != 6:
+                return encrypted_mac
+                
+            # Decritta
+            cipher = AES.new(self.mac_key, AES.MODE_ECB)
+            # Converti il MAC crittato in numero
+            mac_num = int(''.join(parts), 16)
+            data = mac_num.to_bytes(6, byteorder='big')
+            padded = pad(data, 16)
+            decrypted = cipher.decrypt(padded)
+            
+            # Ricostruisci il MAC originale
+            dec_num = int.from_bytes(decrypted[:6], byteorder='big')
+            
+            # Formato MAC originale
+            original_mac = []
+            for i in range(6):
+                original_mac.insert(0, f"{dec_num & 255:02x}")
+                dec_num >>= 8
+                
+            return ':'.join(original_mac)
+            
+        except Exception as e:
+            logging.error(f"Error decrypting MAC {encrypted_mac}: {e}")
+            return encrypted_mac
+
 @dataclass
 class BatchResult:
     """
@@ -282,53 +458,23 @@ class Validator:
     """
     @staticmethod
     def is_valid_mac(address: str) -> bool:
-        """
-        Verifica se l'indirizzo MAC è valido.
-        
-        Args:
-            address: Indirizzo da verificare
-            
-        Returns:
-            bool: True se l'indirizzo è un MAC valido, False altrimenti
-            
-        Notes:
-            Accetta formati con ':' o '-' come separatori
-        """
+        """Verifica se l'indirizzo MAC è valido."""
         if not address:
             logging.info(f"Validation failed for empty MAC address")
             return False
-        mac_pattern = re.compile(r'^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$')
-        if mac_pattern.match(address):
-            logging.info(f"Validated MAC address: {address}")
-            return True
-        else:
-            logging.info(f"Invalid MAC address: {address}")
-            return False
+        mac_pattern = re.compile(r'^([0-9A-Fa-f]{2}[:]){5}([0-9A-Fa-f]{2})$')
         return bool(mac_pattern.match(address))
     
     @staticmethod
     def is_valid_ip(address: str) -> bool:
-        """
-        Verifica se l'indirizzo IP è valido.
-        
-        Args:
-            address: Indirizzo da verificare
-            
-        Returns:
-            bool: True se l'indirizzo è un IP valido, False altrimenti
-            
-        Notes:
-            Supporta sia IPv4 che IPv6
-        """
+        """Verifica se l'indirizzo IP è valido."""
         if not address:
             logging.info(f"Validation failed for empty IP address")
             return False
         try:
             ipaddress.ip_address(address)
-            logging.info(f"Validated IP address: {address}")
             return True
         except ValueError:
-            logging.info(f"Invalid IP address: {address}")
             return False
     
     @staticmethod
@@ -384,6 +530,14 @@ class Validator:
         Validator.validate_pcap_file(filepath)
         return filepath
 
+@dataclass
+class Shard:
+    """
+    Rappresenta uno shard con il suo dizionario e lock associato.
+    Raggruppa logicamente i dati con il loro meccanismo di sincronizzazione.
+    """
+    data: Dict[str, str]
+    lock: RLock
 
 class NetworkShardedDict:
     """
@@ -395,8 +549,7 @@ class NetworkShardedDict:
     - Accesso thread-safe ai dati
     
     Attributes:
-        _shards: Lista di dizionari per lo sharding
-        _locks: Lock per ogni shard
+        
         _hot_cache: Cache LRU per accessi veloci
         _hot_cache_lock: Lock per la cache
     """
@@ -408,16 +561,14 @@ class NetworkShardedDict:
             num_shards: Numero di shards
             max_cache_entries: Dimensione massima della cache LRU
         """
-        self._shards: List[Dict[str, str]] = [
-            {} for _ in range(num_shards)
-        ]
-        self._locks: List[threading.RLock] = [
-            threading.RLock() for _ in range(num_shards)
-        ]
-        self._hot_cache = collections.OrderedDict()
-        self._max_cache_entries = max_cache_entries
-        self._hot_cache_lock = threading.RLock()
+        if num_shards < 1:
+            raise ValueError("Number of shards must be positive")
         
+        self._shards: List[Shard] = [Shard(data={},lock=RLock()) for _ in range (num_shards)]
+        self._hot_cache: OrderedDictType[str, Tuple[int, str]] = OrderedDict()
+        self._max_cache_entries: int= max_cache_entries
+        self._hot_cache_lock = threading.RLock()
+
     def _get_shard_index(self, address: str) -> int:
         """
         Determina l'indice dello shard per un indirizzo.
@@ -455,9 +606,7 @@ class NetworkShardedDict:
                 logging.info(f"Removed address {address} from cache to update it.")
             
             if len(self._hot_cache) >= self._max_cache_entries: #se cache piena
-                old_key, _ = self._hot_cache.popitem(last=False)
-                logging.info(f"Cache full. Evicted oldest address: {old_key}")
-                #self._hot_cache.popitem(last=False) #rimuovo il più vecchio
+                self._hot_cache.popitem(last=False)
             
             self._hot_cache[address] = (shard_idx, value)
             logging.info(f"Added address {address} to cache with value: {value[:50]}")
@@ -477,41 +626,40 @@ class NetworkShardedDict:
         Raises:
             AddressNotFoundError: Se l'indirizzo non viene trovato
         """
+        if not address:
+            raise ValueError("Address cannot be empty")
+        
         try:
-            # Prima controlla la cache
+            # Prima controlliamo la cache
             with self._hot_cache_lock:
                 if cached := self._hot_cache.get(address):
                     self._hot_cache.move_to_end(address)
-                    logging.info(f"Cache hit for address {address}")
                     return cached[1]
             
             # Cache miss, cerca nello shard
             shard_idx = self._get_shard_index(address)
+            shard= self._shards[shard_idx]
             
-            value = None
-            # Prima ottieni il valore dallo shard
-            with self._locks[shard_idx]:
-                value = self._shards[shard_idx].get(address)
-            
-            if value:
-                # Se il valore è stato trovato, aggiorna la cache
+            with shard.lock:
                 with self._hot_cache_lock:
-                    self._update_cache(address, shard_idx, value)
-                logging.info(f"Address {address} found in shard {shard_idx}")
-                return value
-            
-            logging.error(f"Address {address} not found in cache or shards.")
-            raise AddressNotFoundError(
-                f"Address {address} not found in cache or shards. "
-                "This might indicate data corruption or synchronization issues."
-            )
-            
+                    #Ricontrolliamo cache dopo aver acquisito lock
+                    if cached := self._hot_cache.get(address):
+                        self._hot_cache.move_to_end(address)
+                        logging.info(f"Cache hit for address {address}")
+                        return cached[1]
+                    #Non in cache cerchiamo nello shard
+                    if value:= self._shards[shard_idx].data.get(address):
+                        self._update_cache(address,shard_idx,value)
+                        return value
+            #Se arriviamo qui indirizzo non esiste    
+            raise AddressNotFoundError(f"Address {address} not found")
+        
         except AddressNotFoundError:
             raise
         except Exception as e:
             logging.error(f"Error retrieving value for {address}: {e}")
             raise
-    
+        
     def set(self, address: str, value: str) -> None:
         """
         Memorizza un valore nello shard appropriato e aggiorna la cache.
@@ -523,17 +671,21 @@ class NetworkShardedDict:
         Thread Safety:
             Metodo thread-safe grazie all'uso di lock separati per shard e cache
         """
+        if not address:
+            raise ValueError("Address cannot be empty")
+        
+        if not isinstance(value, str):
+            raise ValueError("Value must be a string")
         try:
             shard_idx = self._get_shard_index(address)
-            
-            # Prima aggiorna lo shard
-            with self._locks[shard_idx]:
-                self._shards[shard_idx][address] = value
-                logging.info(f"Set address {address} in shard {shard_idx} with value: {value[:50]}")
-                
-            # Poi, separatamente, aggiorna la cache
-            with self._hot_cache_lock:
-                self._update_cache(address, shard_idx, value)
+            shard = self._shards[shard_idx]
+            # Acquisiamo i lock in ordine consistente per evitare deadlock
+            with shard.lock:
+                with self._hot_cache_lock:
+                    #Aggiorno entrambe le strutture mentre ho i lock
+                    shard.data[address] = value
+                    self._update_cache(address,shard_idx,value)
+                    logging.info(f"Set address {address} in shard {shard_idx} with value: {value[:50]}")
                 
         except Exception as e:
             logging.error(f"Error setting value for {address}: {e}")
@@ -542,28 +694,18 @@ class NetworkShardedDict:
 class BaseAddressCryptographer(ABC):
     """
     Classe base astratta per la crittografia/decrittografia degli indirizzi.
-    
-    Fornisce le funzionalità base per:
-    - Gestione della cache degli indirizzi
-    - Crittografia/decrittografia usando Fernet
-    - Validazione base degli indirizzi
-    
-    Attributes:
-        _address_map: Dizionario shardato per la cache degli indirizzi
-        _fernet: Istanza di Fernet per crittografia
-        _is_encrypting: Flag che indica se stiamo crittando o decrittando
     """
-    def __init__(self, fernet: Fernet, is_encrypting: bool, num_shards: int):
+    def __init__(self, key: bytes , is_encrypting: bool, num_shards: int):
         """
         Inizializza il cryptographer base.
         
         Args:
-            fernet: Istanza di Fernet per la crittografia
+            key: Chiave AES per la crittografia
             is_encrypting: True per crittografia, False per decrittografia
             num_shards: Numero di shards per il dizionario degli indirizzi
         """
         self._address_map = NetworkShardedDict(num_shards=num_shards)
-        self._fernet = fernet
+        self._aes = AESAddressCrypto(key)
         self._is_encrypting = is_encrypting
 
     @abstractmethod
@@ -588,52 +730,63 @@ class BaseAddressCryptographer(ABC):
         
         Args:
             address: Indirizzo da processare
-            
+                
         Returns:
-            Indirizzo processato
-            
-        Notes:
-            - Controlla prima la cache
-            - Valida l'indirizzo
-            - Cripta/decripta usando Fernet
-            - Aggiorna la cache con il risultato
+            str: Indirizzo processato
         """
         try:
-            # Se stiamo decrittando, assumiamo che l'input sia già stato validato durante la crittografia
-            if not self._is_encrypting:
-                logging.debug(f"Decryption mode: returning unmodified address {address}")
+            # Prima verifica che l'indirizzo non sia vuoto
+            if not address:
+                logging.debug("Empty address received")
                 return address
             
-            # Valida solo se stiamo crittografando
-            if not self._validate_address(address):
-                logging.warning(f"Invalid address format for encryption: {address}")
-                return addres
-            
-            # Prima cerca nella cache
-            try:
-                cached_value = self._address_map.get(address)
-                if cached_value is not None:
-                    logging.debug(f"Address {address} retrieved from cache")
-                    return cached_value
-            except AddressNotFoundError:
-                pass  # Se non trovato in cache, procedi con la crittografia
-            
-            # Processa l'indirizzo
-            try:
-                if self._is_encrypting:
-                    processed = self._fernet.encrypt(address.encode()).decode()
-                else:
-                    processed = self._fernet.decrypt(address.encode()).decode()
+            if self._is_encrypting:
+                # In modalità crittografia, valida l'indirizzo originale
+                if not self._validate_address(address):
+                    logging.debug(f"Skipping invalid address format: {address}")
+                    return address
+                    
+                # Dopo la validazione, controlla la cache
+                try:
+                    cached_value = self._address_map.get(address)
+                    if cached_value is not None:
+                        logging.debug(f"Cache hit for address: {address}")
+                        return cached_value
+                except AddressNotFoundError:
+                    pass
                 
-                # Salva il risultato nella cache (sia per encrypt che decrypt)
+                # Se non in cache, cripta e salva
+                processed = self._encrypt_address(address)
                 self._address_map.set(address, processed)
-                logging.debug(f"Address {address} {'encrypted' if self._is_encrypting else 'decrypted'} and cached")
                 return processed
                 
-            except Exception as e:
-                logging.error(f"Unable to {'encrypt' if self._is_encrypting else 'decrypt'} IP address: {address}. Error: {str(e)}")
-                return address
+            else:
+                # In modalità decrittazione
+                try:
+                    # Prima controlla la cache
+                    cached_value = self._address_map.get(address)
+                    if cached_value is not None:
+                        logging.debug(f"Cache hit for encrypted address: {address}")
+                        return cached_value
+                except AddressNotFoundError:
+                    pass
                 
+                # Se non in cache, decripta
+                try:
+                    processed = self._decrypt_address(address)
+                    # Valida l'indirizzo decrittato
+                    if not self._validate_address(processed):
+                        logging.warning(f"Decrypted address is invalid: {processed}")
+                        return address
+                        
+                    # Se valido, salva in cache e restituisci
+                    self._address_map.set(address, processed)
+                    return processed
+                    
+                except Exception as e:
+                    logging.warning(f"Failed to decrypt address {address}: {e}")
+                    return address
+                    
         except Exception as e:
             logging.warning(f"Unable to process address: {address}. Error: {str(e)}")
             return address
@@ -641,62 +794,174 @@ class BaseAddressCryptographer(ABC):
 class IPCryptographer(BaseAddressCryptographer):
     """
     Gestisce la crittografia/decrittografia degli indirizzi IP.
-    
-    Estende BaseAddressCryptographer con:
-    - Validazione specifica per indirizzi IP
-    - Gestione di indirizzi IPv4 e IPv6
     """
-    def _validate_address(self, ip: str) -> bool:
+    def _validate_address(self, address: str) -> bool:
         """
         Valida un indirizzo IP.
         
         Args:
-            ip: Indirizzo IP da validare
+            address: Indirizzo IP da validare
             
         Returns:
-            True se è un IP valido e siamo in modalità crittografia,
-            True se siamo in decrittografia (assumiamo input valido),
-            False altrimenti
+            bool: True se è un IP valido, False altrimenti
         """
-        # In decrittazione, accettiamo l'input senza validazione
-        if not self._is_encrypting:
-            return True
-        
         try:
-            return Validator.is_valid_ip(ip)
+            return Validator.is_valid_ip(address)
         except Exception as e:
-            logging.warning(f"Error validating IP address: {ip}. Error: {str(e)}")
+            logging.warning(f"Error validating IP address: {address}. Error: {str(e)}")
             return False
+
+    def _encrypt_address(self, address: str) -> str:
+        """
+        Cripta un indirizzo IP. Cripta solo gli ultimi due ottetti.
+        
+        Args:
+            address: Indirizzo IP da crittare
+            
+        Returns:
+            str: Indirizzo IP con gli ultimi due ottetti crittati
+        """
+        try:
+            return self._aes.encrypt_ip(address)
+        except Exception as e:
+            logging.error(f"Error encrypting IP address: {address}. Error: {str(e)}")
+            return address
+
+    def _decrypt_address(self, address: str) -> str:
+        """
+        Decripta un indirizzo IP.
+        
+        Args:
+            address: Indirizzo IP da decrittare
+            
+        Returns:
+            str: Indirizzo IP decrittato
+        """
+        try:
+            return self._aes.decrypt_ip(address)
+        except Exception as e:
+            logging.error(f"Error decrypting IP address: {address}. Error: {str(e)}")
+            return address
 
 class MACCryptographer(BaseAddressCryptographer):
     """
     Gestisce la crittografia/decrittografia degli indirizzi MAC.
-    
-    Estende BaseAddressCryptographer con:
-    - Validazione specifica per indirizzi MAC
-    - Supporto per diversi formati di MAC address (: o -)
     """
-    def _validate_address(self, mac: str) -> bool:
+    def _validate_address(self, address: str) -> bool:
         """
         Valida un indirizzo MAC.
         
         Args:
-            mac: Indirizzo MAC da validare
+            address: Indirizzo MAC da validare
             
         Returns:
-            True se è un MAC valido e siamo in modalità crittografia,
-            True se siamo in decrittografia (assumiamo input valido),
-            False altrimenti
+            bool: True se è un MAC valido, False altrimenti
         """
-        if not self._is_encrypting:
-            return True
-        
         try:
-            return Validator.is_valid_mac(mac)
+            return Validator.is_valid_mac(address)
         except Exception as e:
-            logging.warning(f"Error validating MAC address: {mac}. Error: {str(e)}")
+            logging.warning(f"Error validating MAC address: {address}. Error: {str(e)}")
             return False
 
+    def _encrypt_address(self, address: str) -> str:
+        """
+        Cripta un indirizzo MAC. Cripta solo gli ultimi tre ottetti.
+        
+        Args:
+            address: Indirizzo MAC da crittare
+            
+        Returns:
+            str: Indirizzo MAC con gli ultimi tre ottetti crittati
+        """
+        try:
+            return self._aes.encrypt_mac(address)
+        except Exception as e:
+            logging.error(f"Error encrypting MAC address: {address}. Error: {str(e)}")
+            return address
+
+    def _decrypt_address(self, address: str) -> str:
+        """
+        Decripta un indirizzo MAC.
+        
+        Args:
+            address: Indirizzo MAC da decrittare
+            
+        Returns:
+            str: Indirizzo MAC decrittato
+        """
+        try:
+            return self._aes.decrypt_mac(address)
+        except Exception as e:
+            logging.error(f"Error decrypting MAC address: {address}. Error: {str(e)}")
+            return address
+
+@contextmanager
+def managed_pcap_writer(output_path: str, is_encrypting: bool):
+    """
+    Context manager per la gestione sicura della scrittura di file PCAP.
+    Se il file di output esiste già, chiede all'utente se vuole sovrascriverlo.
+    
+    Args:
+        output_path: Il percorso del file di output finale
+        is_encrypting: True se stiamo crittando, False se decrittando
+        
+    Raises:
+        SystemExit: Se l'utente sceglie di non sovrascrivere il file
+        Exception: Per errori durante la gestione dei file
+    """
+    temp_path = f"{output_path}.tmp"
+    operation = "encrypted" if is_encrypting else "decrypted"
+    
+    # Controllo preliminare dell'esistenza del file
+    if os.path.exists(output_path):
+        while True:
+            print(f"\nA {operation} file already exists at:")
+            print(f"'{output_path}'")
+            response = input(f"Do you want to overwrite it? [y/n]: ").lower()
+            if response in ['y', 'n']:
+                if response == 'n':
+                    print("\nOperation cancelled. No files were modified.")
+                    logging.info("User chose not to overwrite existing file. Exiting.")
+                    sys.exit(0)
+                break
+            print("\nPlease enter 'y' or 'n'")
+            
+    # Se l'utente ha scelto di sovrascrivere o il file non esisteva
+    logging.info(f"Starting {operation} file creation at: {output_path}")
+    
+    try:
+        # Assicurati che non ci siano file temporanei residui
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+            logging.info(f"Removed existing temporary file: {temp_path}")
+        
+        yield temp_path
+        
+    finally:
+        # Gestione del file temporaneo alla fine del blocco with
+        if os.path.exists(temp_path):
+            if sys.exc_info()[0] is None:  # Nessun errore durante l'esecuzione
+                try:
+                    # Se esiste un file di output precedente, rimuovilo
+                    if os.path.exists(output_path):
+                        os.remove(output_path)
+                        logging.info(f"Removed existing file: {output_path}")
+                    
+                    # Sposta il file temporaneo nella destinazione finale
+                    shutil.move(temp_path, output_path)
+                    logging.info(f"Successfully created {operation} file: {output_path}")
+                    
+                except Exception as e:
+                    # Se qualcosa va male durante la finalizzazione
+                    logging.error(f"Error while finalizing {operation} file: {e}")
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                    raise
+            else:
+                # Se ci sono stati errori durante il processing
+                logging.error(f"Processing failed, cleaning up temporary file")
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
 
 class PacketCryptographer:
     """
@@ -742,10 +1007,9 @@ class PacketCryptographer:
         self.completion_futures: List[Future] = []
         
         # Inizializza cryptographers
-        num_shards = num_threads * 2  # Sharding ottimale basato sul numero di thread
-        self.fernet = Fernet(encryption_key)
-        self.ip_cryptographer = IPCryptographer(self.fernet, is_encrypting, num_shards)
-        self.mac_cryptographer = MACCryptographer(self.fernet, is_encrypting, num_shards)
+        num_shards = num_threads * 2 # Sharding ottimale basato sul numero di thread
+        self.ip_cryptographer = IPCryptographer(encryption_key, is_encrypting, num_shards)
+        self.mac_cryptographer = MACCryptographer(encryption_key, is_encrypting, num_shards)
         
         # Batch processing
         self.batch_processor = BatchProcessor()
@@ -764,6 +1028,18 @@ class PacketCryptographer:
         }
         self.error_counts: DefaultDict[str, int] = defaultdict(int)
         self.error_lock = threading.Lock()
+    
+    def _initialize_output_file(self):
+        """
+        Inizializza il file di output vuoto.
+        """
+        try:
+            # Crea un file PCAP vuoto con wrpcap
+            wrpcap(self.output_path, [])
+            logging.info(f"Initialized empty output file: {self.output_path}")
+        except Exception as e:
+            logging.error(f"Failed to initialize output file: {e}")
+            raise
 
     def handle_error(self, error_type: str, error: Exception) -> None:
         """
@@ -788,29 +1064,37 @@ class PacketCryptographer:
     def process_packet(self, packet: Packet) -> Tuple[bool, Optional[Packet]]:
         """
         Processa un singolo pacchetto.
-        
-        Args:
-            packet: Il pacchetto da processare
-            
-        Returns:
-            Tuple[bool, Optional[Packet]]: (successo, pacchetto_processato)
         """
         try:
             #Crea una copia del pacchetto prima di modificarlo
             new_packet = packet.copy()
+            modified=False
             if IP in packet:
-                logging.info(f"Processing IP src: {packet[IP].src}, dst: {packet[IP].dst}")
-                new_packet[IP].src = self.ip_cryptographer.process_address(packet[IP].src)
-                new_packet[IP].dst = self.ip_cryptographer.process_address(packet[IP].dst)
-                logging.info(f"Processed IP src: {new_packet[IP].src}, dst: {new_packet[IP].dst}")
+                old_src = new_packet[IP].src
+                old_dst = new_packet[IP].dst
+                new_src = self.ip_cryptographer.process_address(old_src)
+                new_dst = self.ip_cryptographer.process_address(old_dst)
+
+                if new_src != old_src or new_dst != old_dst:
+                    new_packet[IP].src = new_src
+                    new_packet[IP].dst = new_dst
+                    modified = True
+                    logging.debug(f"Modified IP addresses: {old_src}->{new_src}, {old_dst}->{new_dst}")
             if Ether in packet:
-                logging.info(f"Processing MAC src: {packet[Ether].src}, dst: {packet[Ether].dst}")
-                new_packet[Ether].src = self.mac_cryptographer.process_address(packet[Ether].src)
-                new_packet[Ether].dst = self.mac_cryptographer.process_address(packet[Ether].dst)
-                logging.info(f"Processed MAC src: {new_packet[Ether].src}, dst: {new_packet[Ether].dst}")
+                old_src = new_packet[Ether].src
+                old_dst = new_packet[Ether].dst
+                new_src = self.mac_cryptographer.process_address(old_src)
+                new_dst = self.mac_cryptographer.process_address(old_dst)
                 
-            packet=new_packet
-            return True, packet
+                if new_src != old_src or new_dst != old_dst:
+                    new_packet[Ether].src = new_src
+                    new_packet[Ether].dst = new_dst
+                    modified = True
+                    logging.debug(f"Modified MAC addresses: {old_src}->{new_src}, {old_dst}->{new_dst}")
+                
+            # Restituisci il pacchetto solo se è stato effettivamente modificato
+            return modified, new_packet if modified else None
+                
         except Exception as e:
             logging.error(f"Error processing packet: {e}")
             self.handle_error('major', e)
@@ -845,9 +1129,9 @@ class PacketCryptographer:
                 if success:
                     processed_packets.append(processed_packet)
                     with self.processing_lock:
-                        self.stats.processed_packets += 1
+                        self.stats.processed_packets+=1
                         if self.stats.processed_packets % 1000 == 0:
-                            progress = (self.stats.processed_packets / self.stats.total_packets) * 100
+                            progress = (self.stats.processed_packets/ self.stats.total_packets) * 100
                             logging.info(f"Progress: {progress:.2f}% ({self.stats.processed_packets}/{self.stats.total_packets})")
                 else:
                     failed_packets.append(packet)
@@ -861,17 +1145,16 @@ class PacketCryptographer:
         
         return BatchResult(processed_packets, failed_packets, errors, time.time() - start_time)
 
-    def _write_batch_results(self, batch_result: BatchResult) -> None:
+    def _write_batch_results(self, batch_result: BatchResult,output_file: str) -> None:
         """
         Scrive i risultati del batch su file in modo thread-safe.
         
         Args:
             batch_result: Risultati del batch da scrivere
-            
-        Notes:
-            - Gestisce directory relative al path di anonymizer.py
-            - In fase di criptazione scrive in FileCriptati
-            - In fase di decriptazione scrive in FileDecriptati
+            output_file: Path del file su cui scrivere (può essere il file temporaneo)
+         Notes:
+            - In modalità context manager, output_file sarà il file .tmp
+            - Il context manager si occuperà di rinominare/spostare il file nella posizione finale
         """
         if not batch_result.processed_packets:
             return
@@ -881,46 +1164,43 @@ class PacketCryptographer:
             with self.output_lock:
                 try:
                     packets_to_write = []
-                    
                     # Prepara i pacchetti da scrivere
                     for packet in batch_result.processed_packets:
-                        try:
-                            if self.is_encrypting:
-                                packets_to_write.append(packet)
-                            else:
-                                # Validazione per pacchetti decriptati
-                                is_valid = True
-                                if IP in packet:
-                                    if not (Validator.is_valid_ip(packet[IP].src) and 
-                                        Validator.is_valid_ip(packet[IP].dst)):
-                                        logging.warning(f"Invalid decrypted IP address found. "
-                                                    f"Src: {packet[IP].src}, Dst: {packet[IP].dst}")
-                                        is_valid = False
-                                
-                                if Ether in packet:
-                                    if not (Validator.is_valid_mac(packet[Ether].src) and 
-                                        Validator.is_valid_mac(packet[Ether].dst)):
-                                        logging.warning(f"Invalid decrypted MAC address found. "
-                                                    f"Src: {packet[Ether].src}, Dst: {packet[Ether].dst}")
-                                        is_valid = False
-                                
-                                if is_valid:
+                        if packet is not None and hasattr(packet, 'name') and packet.name == 'Ethernet':  # Skip None packets o pacchetti non Ethernet
+                            try:
+                                if self.is_encrypting:
                                     packets_to_write.append(packet)
                                 else:
-                                    logging.error("Skipping packet with invalid decrypted addresses")
+                                    is_valid = True
+                                    if IP in packet:
+                                        if not (Validator.is_valid_ip(packet[IP].src) and 
+                                            Validator.is_valid_ip(packet[IP].dst)):
+                                            logging.warning(f"Invalid decrypted IP address found. "
+                                                        f"Src: {packet[IP].src}, Dst: {packet[IP].dst}")
+                                            is_valid = False
                                     
-                        except Exception as e:
-                            logging.error(f"Error processing packet for writing: {e}")
-                            continue
+                                    if Ether in packet:
+                                        if not (Validator.is_valid_mac(packet[Ether].src) and 
+                                            Validator.is_valid_mac(packet[Ether].dst)):
+                                            logging.warning(f"Invalid decrypted MAC address found. "
+                                                        f"Src: {packet[Ether].src}, Dst: {packet[Ether].dst}")
+                                            is_valid = False
+                                    
+                                    if is_valid:
+                                        packets_to_write.append(packet)
+                                        
+                            except Exception as e:
+                                logging.error(f"Error processing packet for writing: {e}")
+                                continue
 
                     if packets_to_write:
                         wrpcap(
-                            filename=output_path,
-                            pkt=packets_to_write,
+                            output_file,
+                            packets_to_write,
                             append=True
                         )
                         
-                        if not os.path.exists(self.output_path):
+                        if not os.path.exists(output_file):
                             raise IOError(f"Failed to write to output file: {self.output_path}")
                         
                         operation = "encrypted" if self.is_encrypting else "decrypted"
@@ -953,54 +1233,59 @@ class PacketCryptographer:
         try:
             logging.info(f"{'Encrypting' if self.is_encrypting else 'Decrypting'} packets...")
             
-            failed_packets = []  # Lista per pacchetti falliti
-            
+            with managed_pcap_writer(self.output_path, self.is_encrypting) as temp_path:
+                wrpcap(temp_path,[])
+                failed_packets = [] #lista pacchetti falliti
+                
             # Primo passaggio: processo normale
-            with PcapReader(self.input_path) as reader:
-                for packet in reader:
-                    if self.should_stop.is_set():
-                        break
-                    self.stats.total_packets += 1
-                    
-                    if completed_batch := self.batch_processor.add_packet(packet):
-                        future = self.thread_pool.submit(self._process_batch, completed_batch)
-                        result = future.result()
-                        failed_packets.extend(result.failed_packets)
-                        self._write_batch_results(result)
-            
-            # Processo gli ultimi pacchetti rimasti
-            remaining = self.batch_processor.get_remaining()
-            if remaining:
-                future = self.thread_pool.submit(self._process_batch, remaining)
-                result = future.result()
-                failed_packets.extend(result.failed_packets)
-                self._write_batch_results(result)
-            
-            # Retry pacchetti falliti finché necessario
-            while failed_packets:
-                self.stats.retry_count += 1
-                logging.info(f"Retry attempt #{self.stats.retry_count} for {len(failed_packets)} failed packets...")
+                with PcapReader(self.input_path) as reader:
+                    for packet in reader:
+                        if self.should_stop.is_set():
+                            break
+                        with self.processing_lock:
+                            self.stats.total_packets += 1
+                        
+                        
+                        if completed_batch := self.batch_processor.add_packet(packet):
+                            future = self.thread_pool.submit(self._process_batch, completed_batch)
+                            result = future.result()
+                            failed_packets.extend(result.failed_packets)
+                            #Passiamo temp_path alla scrittura
+                            self._write_batch_results(result,temp_path)
                 
-                # Uso batch più piccoli per i retry
-                retry_batch_size = min(100, len(failed_packets))
-                new_failed_packets = []
-                
-                for i in range(0, len(failed_packets), retry_batch_size):
-                    retry_batch = failed_packets[i:i + retry_batch_size]
-                    future = self.thread_pool.submit(self._process_batch, retry_batch)
+                # Processo gli ultimi pacchetti rimasti
+                remaining = self.batch_processor.get_remaining()
+                if remaining:
+                    future = self.thread_pool.submit(self._process_batch, remaining)
                     result = future.result()
-                    self._write_batch_results(result)
+                    failed_packets.extend(result.failed_packets)
+                    self._write_batch_results(result,temp_path)
+                
+                # Retry pacchetti falliti finché necessario
+                while failed_packets:
+                    self.stats.retry_count += 1
+                    logging.info(f"Retry attempt #{self.stats.retry_count} for {len(failed_packets)} failed packets...")
                     
-                    if result.failed_packets:
-                        new_failed_packets.extend(result.failed_packets)
+                    # Uso batch più piccoli per i retry
+                    retry_batch_size = min(100, len(failed_packets))
+                    new_failed_packets = []
+                    
+                    for i in range(0, len(failed_packets), retry_batch_size):
+                        retry_batch = failed_packets[i:i + retry_batch_size]
+                        future = self.thread_pool.submit(self._process_batch, retry_batch)
+                        result = future.result()
+                        self._write_batch_results(result,temp_path)
+                        
+                        if result.failed_packets:
+                            new_failed_packets.extend(result.failed_packets)
+                    
+                    failed_packets = new_failed_packets
+                    
+                    if failed_packets:
+                        logging.warning(f"Still {len(failed_packets)} packets failed after retry #{self.stats.retry_count}")
+                        time.sleep(self.stats.retry_count * 0.1)  # Attesa incrementale
                 
-                failed_packets = new_failed_packets
-                
-                if failed_packets:
-                    logging.warning(f"Still {len(failed_packets)} packets failed after retry #{self.stats.retry_count}")
-                    time.sleep(self.stats.retry_count * 0.1)  # Attesa incrementale
-            
-            logging.info("All packets processed successfully!")
+                logging.info("All packets processed successfully!")
             
         except Exception as e:
             logging.error(f"Fatal error during processing: {e}")
@@ -1025,117 +1310,69 @@ class PacketCryptographer:
             logging.error(f"Error during cleanup: {e}")
             raise
 
-
-#def generate_key_filename(input_file: str) -> str:
-#    """
-#    Genera il nome del file per la chiave di crittografia.
-#    
-#    Args:
-#        input_file: Path del file pcap di input
-#        
-#    Returns:
-#        str: Nome del file per la chiave
-#    """
-#    base_name = os.path.basename(input_file)
-#    return os.path.join("chiavi", f"encryption_key_{base_name}.txt")
-
-def generate_key_filename(input_file: str) -> str:
-    """Genera il nome del file per la chiave di crittografia."""
-    return ProjectDirectories.get_key_path(os.path.basename(input_file))
-
-# def load_encryption_key(input_file: str, is_decrypting: bool) -> bytes:
-#     """
-#     Carica o genera la chiave di crittografia.
+def generate_key_filename(input_file: str,is_decrypting: bool) -> str:
+    """
+    Genera il nome del file per la chiave di crittografia.
+    In modalità decrypt rimuove il prefisso 'encrypted_' dal nome del file.
     
-#     Args:
-#         input_file: Path del file pcap
-#         is_decrypting: True se in modalità decrittazione
-        
-#     Returns:
-#         bytes: Chiave di crittografia
-        
-#     Raises:
-#         FileExistsError: Se il file chiave esiste in modalità crittografia
-#         FileNotFoundError: Se il file chiave non esiste in modalità decrittografia
-#         RuntimeError: Per altri errori di gestione chiave
-#     """
-#     key_filename = generate_key_filename(input_file)
+    Args:
+        input_file: Nome del file di input
+        is_decrypting: True se in modalità decrypt
     
-#     try:
-#         if not is_decrypting:  # MODALITA CRITTOGRAFIA
-#             if os.path.exists(key_filename):
-#                 raise FileExistsError(
-#                     f"Key file {key_filename} already exists. "
-#                     "Please backup or remove it first."
-#                 )
-            
-#             key = Fernet.generate_key()
-#             # Crea file temporaneo (Se il processo si interrompe durante la scrittura del file temporaneo, il file chiave originale (se esiste) non viene compromesso)
-#             with tempfile.NamedTemporaryFile(mode='wb', delete=False) as temp_file:
-#                 temp_file.write(key)
-#                 temp_path = temp_file.name
-            
-#             #os.chmod(temp_path, 0o600)  # Permessi ristretti
-#             shutil.move(temp_path, key_filename)
-#             return key
-        
-#         else:  # MODALITA DECRITTAZIONE
-#             if not os.path.exists(key_filename):
-#                 raise FileNotFoundError(
-#                     f"Encryption key file {key_filename} not found"
-#                 )
-            
-#             # Controlla i permessi del file
-#             #current_permissions = os.stat(key_filename).st_mode & 0o777
-#             #if current_permissions != 0o600:
-#                 #logging.warning(
-#                     #f"Insecure key file permissions: {oct(current_permissions)}"
-#                 #)
-            
-#             # Legge e valida la chiave    
-#             with open(key_filename, 'rb') as key_file:
-#                 key = key_file.read()
-#                 if len(key) != 32:
-#                     raise ValueError("Invalid key length")
-#                 try:
-#                     Fernet(key)  # Valida il formato della chiave
-#                 except Exception as e:
-#                     raise ValueError(f"Invalid key format: {e}")
-#             return key
-            
-#     except (IOError, OSError) as e:
-#         raise RuntimeError(f"Error handling encryption key: {e}")
+    Returns:
+        str: Path completo del file chiave
+    """
+    base_filename = os.path.basename(input_file)
+    if is_decrypting and base_filename.startswith("encrypted_"):
+        base_filename = base_filename[len("encrypted_"):]
+    return ProjectDirectories.get_key_path(base_filename)
+
 
 def load_encryption_key(input_file: str, is_decrypting: bool) -> bytes:
-    """Carica o genera la chiave di crittografia."""
-    key_filename = generate_key_filename(input_file)
+    """Carica o genera la chiave AES.
+       In modalità criptazione, genera la chiave e sovrascrive il file se esiste.
+       In modalità decriptazione, carica la chiave esistente."""
+    key_filename = generate_key_filename(input_file,is_decrypting) 
     
     try:
-        if not is_decrypting:
-            if os.path.exists(key_filename):
-                raise FileExistsError(
-                    f"Key file {key_filename} already exists. Please backup or remove it first."
-                )
+        if not is_decrypting: #Modalità criptazione
             
-            key = Fernet.generate_key()
-            with tempfile.NamedTemporaryFile(mode='wb', delete=False) as temp_file:
-                temp_file.write(key)
+            # Genera una chiave AES-128
+            key = get_random_bytes(16)  # 16 bytes = 128 bit
+
+            # Converti in Base64 per salvataggio leggibile
+            key_b64 = base64.b64encode(key).decode('utf-8')
+            # Salva in formato leggibile
+            with tempfile.NamedTemporaryFile(mode='w', delete=False) as temp_file:
+                temp_file.write(key_b64)
+                temp_file.write('\n')  # Aggiungi newline per leggibilità
+                temp_file.write(f'# Chiave AES-128 per il file: {input_file}\n')
+                temp_file.write(f'# Generata il: {time.strftime("%Y-%m-%d %H:%M:%S")}\n')
+                temp_file.write('# Usare questa chiave con --key per decriptare il file\n')
                 temp_path = temp_file.name
             
+            # Sovrascrive il file esistente se presente
             shutil.move(temp_path, key_filename)
+            logging.info(f"{'Updated' if os.path.exists(key_filename) else 'Created'} encryption key file: {key_filename}")
             return key
         
-        else:
+        else: #Modalità decript
             if not os.path.exists(key_filename):
                 raise FileNotFoundError(f"Encryption key file {key_filename} not found")
             
-            with open(key_filename, 'rb') as key_file:
-                key = key_file.read()
-                if len(key) != 32:
-                    raise ValueError("Invalid key length")
-                Fernet(key)  # Valida il formato della chiave
+            with open(key_filename, 'r') as key_file:
+                # Leggi solo la prima riga che contiene la chiave Base64
+                key_b64 = key_file.readline().strip()
+                
+            try:
+                # Converti da Base64 a bytes
+                key = base64.b64decode(key_b64)
+                if len(key) != 16:
+                    raise ValueError("Invalid key length - must be 16 bytes for AES-128")
                 return key
-            
+            except Exception as e:
+                raise ValueError(f"Invalid key format: {e}")
+                
     except (IOError, OSError) as e:
         raise RuntimeError(f"Error handling encryption key: {e}")
     
@@ -1185,18 +1422,23 @@ def main(input_path: str, output_path: str, num_threads: int,
     output_file = os.path.basename(output_path)
     
     if not os.path.exists(input_path):
-        raise FileNotFoundError(f"Input file {input_file} not found")
+        if is_encrypting:
+            raise FileNotFoundError(f"Input file {input_file} not found in FileDaCrittografare directory")
+        else:
+            raise FileNotFoundError(f"Input file {input_file} not found in FileCriptati directory")
         
     if num_threads < 1:
         raise ValueError("Number of threads must be positive")
  
-    # Gestione chiave
+    # Gestione chiave AES
     if provided_key:
         try:
-            encryption_key = provided_key.encode()
-            Fernet(encryption_key)  # Valida formato chiave
+            # La chiave fornita deve essere in base64
+            encryption_key = base64.b64decode(provided_key)
+            if len(encryption_key) != 16:  # AES-128 richiede 16 byte
+                raise ValueError("Invalid key length - must be 16 bytes for AES-128")
         except Exception:
-            raise ValueError("Invalid encryption key provided")
+            raise ValueError("Invalid encryption key provided - must be base64 encoded 16-byte key")
     else:
         encryption_key = load_encryption_key(input_file, not is_encrypting)
 
@@ -1268,24 +1510,27 @@ if __name__ == "__main__":
         # Determina modalità crittografia/decrittazione
         is_encrypting = not args.decrypt  # True se crittografia, False se decrittazione
         
-        input_path = ProjectDirectories.get_input_path(args.input_file)
+        input_path = ProjectDirectories.get_input_path(args.input_file, is_decrypting=not is_encrypting)
         Validator.validate_pcap_file(input_path)
         
         output_path = ProjectDirectories.get_output_path(
             os.path.basename(args.input_file),
             is_encrypting
-        )  # Sarà gestito in main()
-        #print(f"Cercando il file in: {os.path.abspath(input_file)}")
-        #print("Files nella cartella:", os.listdir("FileDaCrittografare"))
-        #print("Permessi di lettura:", os.access(input_file, os.R_OK))
+        )
         
-        # Verifica che la chiave sia fornita solo in decrittazione
-        if args.key and is_encrypting:
-            logging.error("Key parameter can only be used in decryption mode")
-            exit(1)
+        # Verifica che la chiave sia fornita in base64 valido se specificata
+        if args.key:
+            try:
+                decoded_key = base64.b64decode(args.key)
+                if len(decoded_key) != 16:
+                    raise ValueError("Decoded key must be exactly 16 bytes for AES-128")
+            except Exception as e:
+                logging.error(f"Invalid key format: {e}")
+                logging.error("The key must be a base64 encoded string of 16 bytes")
+                exit(1)
         
         # Se viene fornita una chiave diretta in modalità decrypt, la passa a main()
-        encryption_key = args.key if (args.key and not is_encrypting) else None
+        encryption_key = args.key if args.key else None
         
         # Esegue il processing
         main(input_path, output_path, args.threads, is_encrypting, encryption_key)
