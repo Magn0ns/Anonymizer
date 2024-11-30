@@ -1,6 +1,7 @@
 import hashlib
 import os
 import argparse
+import sys
 import tempfile
 import shutil
 from scapy.all import * # type: ignore
@@ -22,6 +23,7 @@ from abc import ABC, abstractmethod
 from Crypto.Cipher import AES # type: ignore
 from Crypto.Random import get_random_bytes # type: ignore
 from Crypto.Util.Padding import pad, unpad # type: ignore
+from scapy.layers.inet6 import IPv6  # type: ignore
 import base64
 # Custom exceptions
 class ProcessingError(Exception):
@@ -32,117 +34,52 @@ class AddressNotFoundError(Exception):
     """Eccezione sollevata quando un indirizzo non viene trovato."""
     pass
 
-class ProjectDirectories:
+class FileManager:
     """
-    Gestisce i percorsi delle directory del progetto.
-    Fornisce funzionalità per:
-    - Setup iniziale delle directory
-    - Validazione e gestione dei percorsi
-    - Gestione centralizzata delle operazioni sui file
+    Gestisce le operazioni sui file dell'applicazione.
+    Lavora nella directory corrente dove viene eseguito il programma.
     """
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    INPUT_DIR = os.path.join(BASE_DIR, "FileDaCrittografare")
-    ENCRYPTED_DIR = os.path.join(BASE_DIR, "FileCriptati")
-    DECRYPTED_DIR = os.path.join(BASE_DIR, "FileDecriptati")
-    KEYS_DIR = os.path.join(BASE_DIR, "Chiavi")
-    
-    @classmethod
-    def setup_project_directories(cls) -> None:
-        """
-        Crea le directory necessarie se non esistono.
-        Deve essere chiamato all'avvio del programma.
-        
-        Raises:
-            RuntimeError: Se non è possibile creare una directory
-        """
-        required_dirs = [
-            cls.INPUT_DIR,
-            cls.ENCRYPTED_DIR, 
-            cls.DECRYPTED_DIR,
-            cls.KEYS_DIR
-        ]
-        
-        for dir_path in required_dirs:
-            if not os.path.exists(dir_path):
-                try:
-                    os.makedirs(dir_path)
-                    logging.info(f"Created project directory: {dir_path}")
-                except Exception as e:
-                    raise RuntimeError(f"Failed to create required directory {dir_path}: {e}")
-            else:
-                logging.info(f"Project directory exists: {dir_path}")
 
-    @classmethod
-    def get_input_path(cls, filename: str,is_decrypting: bool) -> str:
+    @staticmethod
+    def get_output_path(filename: str, is_encrypting: bool) -> str:
         """
-        Costruisce il percorso completo per un file di input.
-        In modalità decrypt, cerca il file nella cartella FileCriptati.
+        Costruisce il nome del file di output in base all'operazione.
+        Per la crittografia: aggiunge '_anon'
+        Per la decrittografia: rimuove '_anon' e aggiunge la data
         
         Args:
-            filename: Nome del file
-            is_decrypting: True se in modalità decrypt
+            filename: Nome del file originale
+            is_encrypting: True se si sta crittando, False se si sta decrittando
             
         Returns:
-            str: Percorso completo nel formato appropriato in base alla modalità
+            str: Nome del file di output formattato appropriatamente
         """
-        if is_decrypting:
-            return os.path.join(cls.ENCRYPTED_DIR, filename)
-        return os.path.join(cls.INPUT_DIR, filename)
+        base_name = os.path.splitext(os.path.basename(filename))[0]
+        extension = os.path.splitext(filename)[1]
+        
+        if is_encrypting:
+            # Per crittografia: aggiungi _anon
+            return f"{base_name}_anon{extension}"
+        else:
+            # Per decrittografia: rimuovi _anon se presente e aggiungi data
+            current_date = time.strftime("%Y%m%d_%H%M%S")
+            if base_name.endswith('_anon'):
+                base_name = base_name[:-5]  # Rimuovi '_anon'
+            return f"{base_name}_{current_date}{extension}"
 
-    @classmethod
-    def get_output_path(cls, filename: str, is_encrypting: bool) -> str:
+    @staticmethod
+    def get_key_path(filename: str) -> str:
         """
-        Costruisce il percorso completo per un file di output.
+        Costruisce il nome del file chiave.
         
         Args:
-            filename: Nome del file
-            is_encrypting: True se stiamo crittando, False se decrittando
+            filename: Nome del file originale
             
         Returns:
-            str: Percorso completo nel formato BASE_DIR/FileCriptati(o FileDecriptati)/filename
+            str: Nome del file chiave (nome_file_key.txt)
         """
-        output_dir = cls.ENCRYPTED_DIR if is_encrypting else cls.DECRYPTED_DIR
-        prefix = "encrypted" if is_encrypting else "decrypted"
-        output_filename = f"{prefix}_{filename}"
-        return os.path.join(output_dir, output_filename)
-
-    @classmethod
-    def get_key_path(cls, input_filename: str) -> str:
-        """
-        Costruisce il percorso completo per un file chiave.
-        
-        Args:
-            input_filename: Nome del file di input
-            
-        Returns:
-            str: Percorso completo nel formato BASE_DIR/chiavi/encryption_key_filename.txt
-        """
-        return os.path.join(cls.KEYS_DIR, f"encryption_key_{input_filename}.txt")
-
-    @classmethod
-
-    def verify_directory_structure(cls) -> bool:
-        """
-        Verifica che la struttura delle directory sia corretta.
-        
-        Returns:
-            bool: True se la struttura è corretta
-            
-        Raises:
-            RuntimeError: Se la struttura non è valida
-        """
-        required_dirs = [
-            cls.INPUT_DIR,
-            cls.ENCRYPTED_DIR,
-            cls.DECRYPTED_DIR,
-            cls.KEYS_DIR
-        ]
-        
-        for dir_path in required_dirs:
-            if not os.path.exists(dir_path) or not os.path.isdir(dir_path):
-                raise RuntimeError(f"Invalid directory structure. Missing or invalid directory: {dir_path}")
-        
-        return True
+        base_name = os.path.splitext(os.path.basename(filename))[0]
+        return f"{base_name}_key.txt"
 
 class AESAddressCrypto:
     """
@@ -159,12 +96,67 @@ class AESAddressCrypto:
         if len(key) != 16:  # AES-128
             raise ValueError("Key must be exactly 16 bytes for AES-128")
         
+        #Genera tre chiavi diverse usando SHA-256
         hash_obj = hashlib.sha256(key)
-        self.ip_key = hash_obj.digest()[:16]
-        self.mac_key = hash_obj.digest()[16:32]
+        digest = hash_obj.digest()
+
+        #Chiavi separate per ogni tipo di indirizzo
+        self.ipv4_key = digest[:16]
+        self.ipv6_key = digest[16:32]
+        self.mac_key = hashlib.sha256(digest[:16]).digest()[:16]
+
         self.block_size = AES.block_size
 
+    def encrypt_ipv6(self, ip: str) -> str:
+        """
+        Critta completamente un indirizzo IPv6 generando un nuovo indirizzo valido.
+        """
+        if not ip:
+            return ip
+            
+        try:
+            # Converti l'IPv6 in bytes
+            ip_obj = ipaddress.IPv6Address(ip)
+            ip_bytes = ip_obj.packed
+
+            # Salva i primi 3 bit dell'indirizzo originale
+            original_first_three = ip_bytes[0] & 0xE0  # 11100000
+        
+            
+            # Critta l'intero indirizzo 
+            cipher = AES.new(self.ipv6_key, AES.MODE_ECB)
+            padded = pad(ip_bytes, self.block_size)
+            encrypted = cipher.encrypt(padded)
+            
+             # Converti direttamente in nuovo indirizzo IPv6
+            new_ip = ipaddress.IPv6Address(encrypted[:16])
+            logging.info(f"Encrypted IPv6: {ip} -> {new_ip}")
+            return new_ip.compressed
+            
+        except Exception as e:
+            logging.error(f"Error encrypting IPv6 address {ip}: {e}")
+            return ip
     
+    def decrypt_ipv6(self, encrypted_ip: str) -> str:
+        """
+        Decripta un indirizzo IPv6 recuperando l'indirizzo originale.
+        """
+        try:
+            ip_obj = ipaddress.IPv6Address(encrypted_ip)
+            ip_bytes = ip_obj.packed
+            
+            cipher = AES.new(self.ipv6_key, AES.MODE_ECB)
+            padded = pad(ip_bytes, 16)
+            decrypted = cipher.decrypt(padded)
+            
+            original_ip = ipaddress.IPv6Address(decrypted[:16])
+            logging.debug(f"Decrypted IPv6: {encrypted_ip} -> {original_ip}")
+            return original_ip.compressed
+            
+        except Exception as e:
+            logging.error(f"Error decrypting IPv6 address {encrypted_ip}: {e}")
+            return encrypted_ip
+        
     def encrypt_ip(self, ip: str) -> str:
         """
         Critta l'intero indirizzo IP in modo reversibile.
@@ -178,7 +170,7 @@ class AESAddressCrypto:
                 return ip
             
             # Usa la chiave specifica per IP
-            cipher = AES.new(self.ip_key, AES.MODE_ECB)  # Usa self.ip_key invece di self.key
+            cipher = AES.new(self.ipv4_key, AES.MODE_ECB)  # Usa self.ip_key invece di self.key
 
             # Converti l'IP in un numero a 32 bit
             ip_num = sum(int(parts[i]) << (24 - 8 * i) for i in range(4))
@@ -214,7 +206,7 @@ class AESAddressCrypto:
                 return encrypted_ip
                 
             # Decritta usando la stessa modalità
-            cipher = AES.new(self.ip_key, AES.MODE_ECB)
+            cipher = AES.new(self.ipv4_key, AES.MODE_ECB)
             # Converti l'IP crittato in numero
             ip_num = sum(int(parts[i]) << (24 - 8 * i) for i in range(4))
             # Convertiamo il numero in 4 bytes
@@ -321,21 +313,13 @@ class BatchResult:
         errors: Lista degli errori incontrati durante il processing
         processing_time: Tempo totale impiegato per processare il batch
     """
-    processed_packets: List[Packet]
-    failed_packets: List[Packet]
+    processed_packets: List[Packet] # type: ignore
+    failed_packets: List[Packet] # type: ignore
     errors: List[Exception]
     processing_time: float
 
 @dataclass
 class ProcessingStats:
-    """
-    Mantiene le statistiche del processing dei pacchetti.
-    
-    Attributes:
-        total_packets: Numero totale di pacchetti da processare
-        processed_packets: Numero di pacchetti processati con successo
-        retry_count: Numero di retry effettuati
-    """
     total_packets: int = 0
     processed_packets: int = 0
     retry_count: int = 0
@@ -476,6 +460,17 @@ class Validator:
             return True
         except ValueError:
             return False
+    @staticmethod
+    def is_valid_ipv6(address: str) -> bool:
+        """Verifica se l'indirizzo IPv6 è valido."""
+        if not address:
+            logging.info(f"Validation failed for empty IPv6 address")
+            return False
+        try:
+            ipaddress.IPv6Address(address)
+            return True
+        except ValueError:
+            return False
     
     @staticmethod
     def validate_file_extension(filepath: str) -> bool:
@@ -581,11 +576,18 @@ class NetworkShardedDict:
         """
         try:
             if Validator.is_valid_ip(address):
-                ip_parts = address.split('.')
-                return int(ip_parts[-1]) % len(self._shards) #Usa l'ultimo ottetto dell'IP per lo sharding.
+                ip_obj = ipaddress.ip_address(address)
+                if isinstance(ip_obj, ipaddress.IPv4Address):
+                    ip_parts = address.split('.')
+                    return int(ip_parts[-1]) % len(self._shards)
+                else:
+                    # Per IPv6 usa gli ultimi 16 bit per lo sharding
+                    ip_bytes = ip_obj.packed
+                    last_16_bits = int.from_bytes(ip_bytes[-2:], byteorder='big')
+                    return last_16_bits % len(self._shards)
             elif Validator.is_valid_mac(address):
                 mac_parts = address.split(':')
-                return (int(mac_parts[-2], 16) + int(mac_parts[-1], 16)) % len(self._shards)#Usa gli ultimi due byte per lo sharding.
+                return (int(mac_parts[-3], 16) + int(mac_parts[-2], 16) + int(mac_parts[-1], 16)) % len(self._shards)#Usa gli ultimi tre byte per lo sharding.
             else:
                 shard_idx= hash(address) % len(self._shards)
                 
@@ -822,7 +824,11 @@ class IPCryptographer(BaseAddressCryptographer):
             str: Indirizzo IP con gli ultimi due ottetti crittati
         """
         try:
-            return self._aes.encrypt_ip(address)
+            ip_obj=ipaddress.ip_address(address)
+            if isinstance(ip_obj, ipaddress.IPv4Address):
+                return self._aes.encrypt_ip(address)
+            else:
+                return self._aes.encrypt_ipv6(address)
         except Exception as e:
             logging.error(f"Error encrypting IP address: {address}. Error: {str(e)}")
             return address
@@ -838,7 +844,11 @@ class IPCryptographer(BaseAddressCryptographer):
             str: Indirizzo IP decrittato
         """
         try:
-            return self._aes.decrypt_ip(address)
+            ip_obj = ipaddress.ip_address(address)
+            if isinstance(ip_obj, ipaddress.IPv4Address):
+                return self._aes.decrypt_ip(address)
+            else:
+                return self._aes.decrypt_ipv6(address)
         except Exception as e:
             logging.error(f"Error decrypting IP address: {address}. Error: {str(e)}")
             return address
@@ -910,7 +920,7 @@ def managed_pcap_writer(output_path: str, is_encrypting: bool):
         Exception: Per errori durante la gestione dei file
     """
     temp_path = f"{output_path}.tmp"
-    operation = "encrypted" if is_encrypting else "decrypted"
+    operation = "anonimizzato" if is_encrypting else "de-anonimizzato"
     
     # Controllo preliminare dell'esistenza del file
     if os.path.exists(output_path):
@@ -982,7 +992,7 @@ class PacketCryptographer:
         - Garantisce che tutti i pacchetti vengano processati
     """
     
-    def __init__(self, input_path: str, output_path: str, num_threads: int,
+    def __init__(self, filename: str, output_path: str, num_threads: int,
                  encryption_key: bytes, is_encrypting: bool):
         """
         Inizializza il cryptographer.
@@ -994,7 +1004,7 @@ class PacketCryptographer:
             encryption_key: Chiave di crittografia/decrittografia
             is_encrypting: True per crittografia, False per decrittografia
         """
-        self.input_path = input_path
+        self.filename = filename
         self.output_path = output_path
         self.encryption_key = encryption_key
         self.is_encrypting = is_encrypting
@@ -1035,7 +1045,7 @@ class PacketCryptographer:
         """
         try:
             # Crea un file PCAP vuoto con wrpcap
-            wrpcap(self.output_path, [])
+            wrpcap(self.output_path, []) # type: ignore
             logging.info(f"Initialized empty output file: {self.output_path}")
         except Exception as e:
             logging.error(f"Failed to initialize output file: {e}")
@@ -1079,7 +1089,19 @@ class PacketCryptographer:
                     new_packet[IP].src = new_src
                     new_packet[IP].dst = new_dst
                     modified = True
-                    logging.debug(f"Modified IP addresses: {old_src}->{new_src}, {old_dst}->{new_dst}")
+
+            if IPv6 in packet:
+                old_src = new_packet[IPv6].src
+                old_dst = new_packet[IPv6].dst
+                new_src = self.ip_cryptographer.process_address(old_src)
+                new_dst = self.ip_cryptographer.process_address(old_dst)
+
+                if new_src != old_src or new_dst != old_dst:
+                    new_packet[IPv6].src = new_src
+                    new_packet[IPv6].dst = new_dst
+                    modified = True
+                    logging.info(f"Modified IPv6: {old_src}->{new_src}, {old_dst}->{new_dst}")
+                    
             if Ether in packet:
                 old_src = new_packet[Ether].src
                 old_dst = new_packet[Ether].dst
@@ -1090,7 +1112,6 @@ class PacketCryptographer:
                     new_packet[Ether].src = new_src
                     new_packet[Ether].dst = new_dst
                     modified = True
-                    logging.debug(f"Modified MAC addresses: {old_src}->{new_src}, {old_dst}->{new_dst}")
                 
             # Restituisci il pacchetto solo se è stato effettivamente modificato
             return modified, new_packet if modified else None
@@ -1166,7 +1187,7 @@ class PacketCryptographer:
                     packets_to_write = []
                     # Prepara i pacchetti da scrivere
                     for packet in batch_result.processed_packets:
-                        if packet is not None and hasattr(packet, 'name') and packet.name == 'Ethernet':  # Skip None packets o pacchetti non Ethernet
+                        if packet is not None and hasattr(packet, 'name'):  # Skip None packets
                             try:
                                 if self.is_encrypting:
                                     packets_to_write.append(packet)
@@ -1179,12 +1200,22 @@ class PacketCryptographer:
                                                         f"Src: {packet[IP].src}, Dst: {packet[IP].dst}")
                                             is_valid = False
                                     
+                                    if IPv6 in packet:
+                                        if not (Validator.is_valid_ipv6(packet[IPv6].src) and 
+                                            Validator.is_valid_ipv6(packet[IPv6].dst)):
+                                            logging.warning(
+                                                f"Invalid decrypted IPv6: "
+                                                f"Src: {packet[IPv6].src}, Dst: {packet[IPv6].dst}"
+                                            )
+                                            is_valid = False
+                                    
                                     if Ether in packet:
                                         if not (Validator.is_valid_mac(packet[Ether].src) and 
                                             Validator.is_valid_mac(packet[Ether].dst)):
                                             logging.warning(f"Invalid decrypted MAC address found. "
                                                         f"Src: {packet[Ether].src}, Dst: {packet[Ether].dst}")
                                             is_valid = False
+                                        logging.info(f"Writing packet with MAC src: {packet[Ether].src}, dst: {packet[Ether].dst}")
                                     
                                     if is_valid:
                                         packets_to_write.append(packet)
@@ -1238,7 +1269,7 @@ class PacketCryptographer:
                 failed_packets = [] #lista pacchetti falliti
                 
             # Primo passaggio: processo normale
-                with PcapReader(self.input_path) as reader:
+                with PcapReader(self.filename) as reader:
                     for packet in reader:
                         if self.should_stop.is_set():
                             break
@@ -1310,29 +1341,13 @@ class PacketCryptographer:
             logging.error(f"Error during cleanup: {e}")
             raise
 
-def generate_key_filename(input_file: str,is_decrypting: bool) -> str:
-    """
-    Genera il nome del file per la chiave di crittografia.
-    In modalità decrypt rimuove il prefisso 'encrypted_' dal nome del file.
-    
-    Args:
-        input_file: Nome del file di input
-        is_decrypting: True se in modalità decrypt
-    
-    Returns:
-        str: Path completo del file chiave
-    """
-    base_filename = os.path.basename(input_file)
-    if is_decrypting and base_filename.startswith("encrypted_"):
-        base_filename = base_filename[len("encrypted_"):]
-    return ProjectDirectories.get_key_path(base_filename)
 
-
-def load_encryption_key(input_file: str, is_decrypting: bool) -> bytes:
+def load_encryption_key(filename: str, is_decrypting: bool) -> bytes:
     """Carica o genera la chiave AES.
        In modalità criptazione, genera la chiave e sovrascrive il file se esiste.
        In modalità decriptazione, carica la chiave esistente."""
-    key_filename = generate_key_filename(input_file,is_decrypting) 
+
+    key_filename = FileManager.get_key_path(filename) 
     
     try:
         if not is_decrypting: #Modalità criptazione
@@ -1346,7 +1361,7 @@ def load_encryption_key(input_file: str, is_decrypting: bool) -> bytes:
             with tempfile.NamedTemporaryFile(mode='w', delete=False) as temp_file:
                 temp_file.write(key_b64)
                 temp_file.write('\n')  # Aggiungi newline per leggibilità
-                temp_file.write(f'# Chiave AES-128 per il file: {input_file}\n')
+                temp_file.write(f'# Chiave AES-128 per il file: {filename}\n')
                 temp_file.write(f'# Generata il: {time.strftime("%Y-%m-%d %H:%M:%S")}\n')
                 temp_file.write('# Usare questa chiave con --key per decriptare il file\n')
                 temp_path = temp_file.name
@@ -1376,80 +1391,46 @@ def load_encryption_key(input_file: str, is_decrypting: bool) -> bytes:
     except (IOError, OSError) as e:
         raise RuntimeError(f"Error handling encryption key: {e}")
     
-def validate_pcap_file(filepath: str) -> bool:
-    """
-    Verifica che il file sia un pcap valido.
-    
-    Args:
-        filepath: Path del file da validare
-        
-    Returns:
-        bool: True se il file è valido
-        
-    Raises:
-        ValueError: Se il file non è un pcap valido
-    """
-    try:
-        if not Validator.validate_file_extension(filepath):
-            raise ValueError(f"Unsupported file extension")
-        with PcapReader(filepath) as reader:
-            next(reader)
-        return True
-    except Exception as e:
-        raise ValueError(f"Invalid PCAP file: {e}")
 
-def main(input_path: str, output_path: str, num_threads: int, 
+def main(filename: str, num_threads: int, 
          is_encrypting: bool, provided_key: Optional[str] = None) -> None:
     """
-    Funzione principale per la gestione della crittografia/decrittografia.
+    Funzione principale semplificata per lavorare nella directory corrente.
     
     Args:
-        input_file: Path del file pcap di input
-        output_file: Path del file di output
+        filename: Nome del file da processare nella directory corrente
         num_threads: Numero di thread da utilizzare
         is_encrypting: True per crittografia, False per decrittografia
         provided_key: Chiave opzionale fornita dall'utente
-        
-    Raises:
-        FileNotFoundError: Se il file di input non esiste
-        ValueError: Se i parametri non sono validi
     """
-    # Validazione struttura directory
-    ProjectDirectories.verify_directory_structure()
-    
-    #estrai nomi di file dai percorsi
-    input_file = os.path.basename(input_path)
-    output_file = os.path.basename(output_path)
-    
-    if not os.path.exists(input_path):
-        if is_encrypting:
-            raise FileNotFoundError(f"Input file {input_file} not found in FileDaCrittografare directory")
-        else:
-            raise FileNotFoundError(f"Input file {input_file} not found in FileCriptati directory")
         
     if num_threads < 1:
         raise ValueError("Number of threads must be positive")
- 
-    # Gestione chiave AES
-    if provided_key:
-        try:
-            # La chiave fornita deve essere in base64
-            encryption_key = base64.b64decode(provided_key)
-            if len(encryption_key) != 16:  # AES-128 richiede 16 byte
-                raise ValueError("Invalid key length - must be 16 bytes for AES-128")
-        except Exception:
-            raise ValueError("Invalid encryption key provided - must be base64 encoded 16-byte key")
-    else:
-        encryption_key = load_encryption_key(input_file, not is_encrypting)
-
-    # Processa il file
-    start_time = time.time()
-    operation = "encryption" if is_encrypting else "decryption"
-    logging.info(f"Starting packet {operation} with {num_threads} threads...")
     
     try:
+        Validator.validate_pcap_file(filename)
+        #Determina i nomi dei file di output
+        output_path = FileManager.get_output_path(filename,is_encrypting)
+
+        # Gestione chiave AES
+        if provided_key:
+            try:
+                # La chiave fornita deve essere in base64
+                encryption_key = base64.b64decode(provided_key)
+                if len(encryption_key) != 16:  # AES-128 richiede 16 byte
+                    raise ValueError("Invalid key length - must be 16 bytes for AES-128")
+            except Exception:
+                raise ValueError("Invalid encryption key provided - must be base64 encoded 16-byte key")
+        else:
+            encryption_key = load_encryption_key(filename, not is_encrypting)
+
+        # Processa il file
+        start_time = time.time()
+        operation = "encryption" if is_encrypting else "decryption"
+        logging.info(f"Starting packet {operation} with {num_threads} threads...")
+
         cryptographer = PacketCryptographer(
-            input_path=input_path,
+            filename=filename,
             output_path=output_path,
             num_threads=num_threads,
             encryption_key=encryption_key,
@@ -1461,13 +1442,9 @@ def main(input_path: str, output_path: str, num_threads: int,
         logging.info(
             f"{operation.capitalize()} completed in {end_time - start_time:.2f} seconds"
         )
-        logging.info(f"Processed packets written to {output_file}")
         
     except ProcessingError as e:
         logging.error(f"Processing error: {e}")
-        raise
-    except Exception as e:
-        logging.error(f"Unexpected error: {e}")
         raise
 
 if __name__ == "__main__":
@@ -1478,62 +1455,49 @@ if __name__ == "__main__":
     )
     logger = logging.getLogger(__name__)
 
-    # Parse argomenti linea comando
-    parser = argparse.ArgumentParser(
-        description="Encrypt or decrypt a Wireshark capture file."
-    )
-    parser.add_argument(
-        "input_file",
-        help="Input Wireshark capture file"
-    )
-    parser.add_argument(
-        "--decrypt",
-        action="store_true",
-        help="Decrypt the capture file instead of encrypting"
-    )
-    parser.add_argument(
-        "--threads",
-        type=int,
-        default=4,
-        help="Number of worker threads (default: 4)"
-    )
-    
-    key_group = parser.add_mutually_exclusive_group()
-    key_group.add_argument(
-        "--key",
-        help="Direct encryption/decryption key (base64 encoded)"
-    )
-
-    args = parser.parse_args()
-
     try:
-        # Determina modalità crittografia/decrittazione
-        is_encrypting = not args.decrypt  # True se crittografia, False se decrittazione
-        
-        input_path = ProjectDirectories.get_input_path(args.input_file, is_decrypting=not is_encrypting)
-        Validator.validate_pcap_file(input_path)
-        
-        output_path = ProjectDirectories.get_output_path(
-            os.path.basename(args.input_file),
-            is_encrypting
+        # Parse argomenti linea comando
+        parser = argparse.ArgumentParser(
+            description="Encrypt or decrypt a Wireshark capture file."
+        )
+        parser.add_argument(
+            "filename",
+            help="Wireshark capture file name"
+        )
+        parser.add_argument(
+            "--decrypt",
+            action="store_true",
+            help="Decrypt the capture file instead of encrypting"
+        )
+        parser.add_argument(
+            "--threads",
+            type=int,
+            default=4,
+            help="Number of worker threads (default: 4)"
         )
         
+        key_group = parser.add_mutually_exclusive_group()
+        key_group.add_argument(
+            "--key",
+            help="Direct encryption/decryption key (base64 encoded)"
+        )
+
+        args = parser.parse_args()
+        # Validazione numero di thread
+        if args.threads < 1:
+            parser.error("Il numero di thread deve essere positivo")
+
+        # Validazione iniziale del file
+        if not os.path.exists(args.filename):
+            parser.error(f"Il file {args.filename} non esiste nella directory corrente")
+        
         # Verifica che la chiave sia fornita in base64 valido se specificata
-        if args.key:
-            try:
-                decoded_key = base64.b64decode(args.key)
-                if len(decoded_key) != 16:
-                    raise ValueError("Decoded key must be exactly 16 bytes for AES-128")
-            except Exception as e:
-                logging.error(f"Invalid key format: {e}")
-                logging.error("The key must be a base64 encoded string of 16 bytes")
-                exit(1)
         
         # Se viene fornita una chiave diretta in modalità decrypt, la passa a main()
-        encryption_key = args.key if args.key else None
+        #encryption_key = args.key if args.key else None
         
         # Esegue il processing
-        main(input_path, output_path, args.threads, is_encrypting, encryption_key)
+        main(args.filename, args.threads, not args.decrypt, args.key)
         
     except FileNotFoundError as e:
         logging.error(str(e))

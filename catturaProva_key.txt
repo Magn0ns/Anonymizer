@@ -1,4 +1,4 @@
-swMCtKOeayppNn/7mjgN2A==
+iIuO6hcFJqloYWs1RRmzew==
 # Chiave AES-128 per il file: catturaProva.pcapng
-# Generata il: 2024-11-25 19:57:20
+# Generata il: 2024-11-30 04:17:28
 # Usare questa chiave con --key per decriptare il file
